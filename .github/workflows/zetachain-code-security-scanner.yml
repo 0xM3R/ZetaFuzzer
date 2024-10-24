@@ -1,0 +1,93 @@
+name: ZetaChain Code Security Scanner v1
+
+on:
+ workflow_dispatch
+#   push:
+#     branches:
+#       - main
+
+jobs:
+  code_scanner:
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+      issues: write
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.OMER_PAT }}
+
+    steps:
+      - name: Checkout code # this checkout current repo to scan + custom CodeQL rules 
+        uses: actions/checkout@v3
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v2
+        with:
+          node-version: 14.x
+
+      - name: Install CodeQL CLI 
+        run: |
+          curl -LO $(curl -s https://api.github.com/repos/github/codeql-cli-binaries/releases/latest | grep "browser_download_url.*codeql-linux64.zip" | cut -d : -f 2,3 | tr -d \")
+          unzip codeql-linux64.zip
+          
+      - name: Install the JavaScript packs
+        run: |
+          ./codeql/codeql pack download codeql/javascript-queries codeql/javascript-upgrades codeql/javascript-all
+      
+      - name: Run CodeQL cli create database for javascript scanning
+        run: |
+          CODEQL_EXTRACTOR_JAVASCRIPT_BUILD_TRACING=on  ./codeql/codeql database create codeql-database --language=javascript
+          
+      - name: Install the custom IOVLABS rules qlpack
+        run: |
+           cd codeql_rules
+           ../codeql/codeql pack install qlpack.yml
+           cd ..
+          
+      - name: Run CodeQL cli in the command line
+        run: |
+          ./codeql/codeql database analyze codeql-database codeql/javascript-queries  --additional-packs=codeql_rules codeql_rules/*.ql --format=sarif-latest --output=codeql-results.sarif
+      - name: Create GitHub Issues
+        uses: actions/github-script@v4
+        with:
+          github-token: ${{ secrets.OMER_PAT }}
+          script: |
+           const fs = require('fs');
+           const results = JSON.parse(fs.readFileSync('codeql-results.sarif', 'utf8'));
+           const issues = results.runs[0].results;
+
+           const createGithubIssue = async (title, body) => {
+             try {
+               await github.issues.create({
+                 owner: context.repo.owner,
+                 repo: context.repo.repo,
+                 title: title,
+                 body: body,
+                 assignee: "0xM3R",
+                 labels: ["CodeQL Report"]
+               });
+               console.log(`Issue created with title: ${title}`);
+             } catch (error) {
+               if ([403, 422].includes(error.status) && error.headers['retry-after']) {
+                 console.log(`Rate limited. Retrying after ${error.headers['retry-after']} seconds.`);
+                 await new Promise(resolve => setTimeout(resolve, error.headers['retry-after'] * 1000));
+                 await createGithubIssue(title, body);
+               } else {
+                 console.error(`Failed to create issue with title: ${title}`);
+                 console.error(error);
+               }
+             }
+           };
+
+           for (const issue of issues) {
+             const ruleId = issue.ruleId;
+             const message = issue.message.text;
+             const file = issue.locations[0].physicalLocation.artifactLocation.uri;
+             const line = issue.locations[0].physicalLocation.region.startLine;
+             const url = `${context.payload.repository.html_url}/blob/${context.payload.repository.default_branch}/${file}#L${line}`;
+             const timestamp = new Date().toISOString();
+             const title = `${message} found on ${file}`;
+             const body = `\nRule ID: ${ruleId}\n Vulnerability Description: ${message}\n\nFile: ${file}\nCode line: ${line}\nURL: ${url}\nTimestamp: ${timestamp}\n\nThis vulnerability was identified by IOVLABS Security Team automation.`;
+             await createGithubIssue(title, body);
+           }
